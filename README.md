@@ -1,6 +1,4 @@
 
-
-
 ### Simulation Code
 
 Code for simulating the battles and assembling the wins database

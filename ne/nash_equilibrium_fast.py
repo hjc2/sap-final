@@ -5,6 +5,7 @@ from scipy.optimize import linprog
 from typing import Tuple, List, Dict
 import warnings
 import os
+import time
 warnings.filterwarnings('ignore')
 
 
@@ -12,6 +13,7 @@ class FastNashSolver:
 
     def __init__(self, csv_path: str):
         print(f"loading data from {csv_path}")
+        start_time = time.time()
 
         # get teams
         first_chunk = pd.read_csv(csv_path, nrows=1000)
@@ -28,27 +30,39 @@ class FastNashSolver:
         print("building payoff matrix")
         self.payoff_matrix = np.zeros((self.n_teams, self.n_teams), dtype=np.float32)
 
-        chunk_size = 50000
+        chunk_size = 100000
         for i, chunk in enumerate(pd.read_csv(csv_path, chunksize=chunk_size)):
+            # vectorized processing
+            t1_arr = chunk['Team1_ID'].values
+            t2_arr = chunk['Team2_ID'].values
+            total_arr = chunk['Total_Battles'].values
+            wins1_arr = chunk['Team1_Wins'].values
+            wins2_arr = chunk['Team2_Wins'].values
+
+            # filter valid battles
+            valid_mask = total_arr > 0
+            t1_valid = t1_arr[valid_mask]
+            t2_valid = t2_arr[valid_mask]
+            payoff_valid = (wins1_arr[valid_mask] - wins2_arr[valid_mask]) / total_arr[valid_mask]
+
+            # update matrix
+            self.payoff_matrix[t1_valid, t2_valid] = payoff_valid
+            self.payoff_matrix[t2_valid, t1_valid] = -payoff_valid
+
+            # update team names
             for _, row in chunk.iterrows():
                 t1 = row['Team1_ID']
                 t2 = row['Team2_ID']
-                total = row['Total_Battles']
-
-                if total > 0:
-                    payoff = (row['Team1_Wins'] - row['Team2_Wins']) / total
-                    self.payoff_matrix[t1, t2] = payoff
-                    self.payoff_matrix[t2, t1] = -payoff
-
-                # update team names
                 if t1 not in self.team_names:
                     self.team_names[t1] = row['Team1_Composition']
                 if t2 not in self.team_names:
                     self.team_names[t2] = row['Team2_Composition']
 
-            print(f"processed chunk {i+1}")
+            elapsed = time.time() - start_time
+            print(f"processed chunk {i+1} ({elapsed:.1f}s)")
 
         print(f"payoff matrix: {self.payoff_matrix.shape}")
+        print(f"data loading completed in {time.time() - start_time:.1f}s")
 
     def find_simple_cycles(self) -> List[Dict]:
         print("searching for cycles")
@@ -108,16 +122,18 @@ class FastNashSolver:
     def solve_nash_equilibrium(self) -> Tuple[np.ndarray, float]:
         print("solving nash equilibrium")
         print(f"problem size: {self.n_teams} teams")
+        start_time = time.time()
 
         # variables
         c = np.zeros(self.n_teams + 1, dtype=np.float32)
         c[-1] = -1
 
         # constraints
+        print("building constraint matrices")
         A_ub = np.column_stack([-self.payoff_matrix.T, np.ones(self.n_teams, dtype=np.float32)])
         b_ub = np.zeros(self.n_teams, dtype=np.float32)
 
-        # zerp sum game
+        # zero sum game
         A_eq = np.zeros((1, self.n_teams + 1), dtype=np.float32)
         A_eq[0, :-1] = 1
         b_eq = np.array([1], dtype=np.float32)
@@ -125,11 +141,13 @@ class FastNashSolver:
         # bounds
         bounds = [(0, None) for _ in range(self.n_teams)] + [(None, None)]
 
-        print("running LP solver")
+        print("running LP solver (this may take a while)")
+        solve_start = time.time()
         result = linprog(
             c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
-            bounds=bounds, method='highs', options={'disp': False}
+            bounds=bounds, method='highs', options={'disp': False, 'presolve': True}
         )
+        solve_time = time.time() - solve_start
 
         if not result.success:
             print(f"LP solver failed: {result.message}")
@@ -139,8 +157,10 @@ class FastNashSolver:
         value = result.x[-1]
 
         support_size = np.sum(strategy > 1e-6)
+        print(f"LP solver completed in {solve_time:.1f}s")
         print(f"game value: {value:.6f}")
         print(f"support size: {support_size} teams ({100*support_size/self.n_teams:.1f}%)")
+        print(f"total time: {time.time() - start_time:.1f}s")
 
         return strategy, value
 
@@ -197,9 +217,29 @@ class FastNashSolver:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         output_base = os.path.join(script_dir, 'nash_results')
 
-        support_df.to_csv(f'{output_base}_support.csv', index=False)
-        print(f"\nsaved support teams to {output_base}_support.csv")
+        # save full nash equilibrium strategy
+        full_strategy_data = []
+        for idx in range(self.n_teams):
+            if idx in self.team_names:
+                expected_payoff = self.payoff_matrix[idx] @ strategy
+                full_strategy_data.append({
+                    'Team_ID': idx,
+                    'Composition': self.team_names[idx],
+                    'Probability': strategy[idx],
+                    'Expected_Payoff': expected_payoff,
+                    'In_Support': strategy[idx] > threshold
+                })
 
+        full_strategy_df = pd.DataFrame(full_strategy_data)
+        full_strategy_df = full_strategy_df.sort_values('Probability', ascending=False)
+        full_strategy_df.to_csv(f'{output_base}_full_strategy.csv', index=False)
+        print(f"\nsaved full nash equilibrium strategy to {output_base}_full_strategy.csv")
+
+        # save support teams
+        support_df.to_csv(f'{output_base}_support.csv', index=False)
+        print(f"saved support teams to {output_base}_support.csv")
+
+        # save dominant teams
         dominant_data = []
         for idx in top_indices:
             payoff = payoffs_vs_uniform[idx]
@@ -212,6 +252,20 @@ class FastNashSolver:
         dominant_df = pd.DataFrame(dominant_data)
         dominant_df.to_csv(f'{output_base}_dominant.csv', index=False)
         print(f"saved dominant teams to {output_base}_dominant.csv")
+
+        # save summary statistics
+        summary = {
+            'Nash_Equilibrium_Value': [nash_value],
+            'Best_Response_Payoff': [best_response_payoff],
+            'Exploitability': [exploitability],
+            'Best_Response_Team': [self.team_names[best_response_idx]],
+            'Support_Size': [len(support_indices)],
+            'Support_Percentage': [100 * len(support_indices) / self.n_teams],
+            'Total_Teams': [self.n_teams]
+        }
+        summary_df = pd.DataFrame(summary)
+        summary_df.to_csv(f'{output_base}_summary.csv', index=False)
+        print(f"saved summary statistics to {output_base}_summary.csv")
 
 def main():
     import sys
