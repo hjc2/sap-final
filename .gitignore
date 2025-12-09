@@ -1,0 +1,9 @@
+
+# .gitignore
+.github/workflows
+.pytest_cache
+venv/
+.venv/
+tmp/
+simulator/*.csv
+playground/
