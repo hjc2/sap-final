@@ -7,3 +7,4 @@ venv/
 tmp/
 simulator/*.csv
 playground/
+.DS_Store
